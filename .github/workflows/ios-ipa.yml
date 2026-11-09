@@ -1,0 +1,206 @@
+name: iOS IPA
+
+# Builds the iOS client (Compose Multiplatform host + the `Shared` Kotlin framework) on a macOS
+# runner and packages an unsigned arm64 .ipa.
+#
+# Unsigned is the point: the artifact carries no developer identity and no provisioning profile,
+# so it installs on a jailbroken device as-is and can be re-signed with anything (SideStore,
+# Sideloadly, esign, a paid developer account) without ever unpacking Xcode's output again.
+#
+# The build is deliberately code-signing free end to end:
+#   * the Gradle framework task is `linkDebugFrameworkIosArm64`, not
+#     `embedAndSignAppleFrameworkForXcode` (which needs a signing identity + provisioning profile);
+#   * `CODE_SIGNING_ALLOWED=NO` strips the ad-hoc signature Xcode would otherwise apply, so the
+#     `.app` is rebuilt cleanly in the packaging step with only the entitlements that survive
+#     re-signing (the App Group is dropped: a re-signer would not carry it into the profile anyway,
+#     and an entitlement the profile does not grant is what makes an install fail with
+#     "application-identifier entitlement" errors).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'iosApp/**'
+      - 'android/**/*iosMain/**'
+      - 'android/shared/**'
+      - 'android/gradle/**'
+      - 'android/gradle.properties'
+      - '.github/workflows/ios-ipa.yml'
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'CFBundleIdentifier'
+        required: false
+        default: 'io.github.beppe2880.opencodemobile'
+      display_name:
+        description: 'App display name'
+        required: false
+        default: 'OpenCode Mobile'
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: OpenCodeMobile
+  BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'io.github.beppe2880.opencodemobile' }}
+  DISPLAY_NAME: ${{ github.event.inputs.display_name || 'OpenCode Mobile' }}
+  # Kotlin 2.4 needs Xcode 16+; macos-15 ships 16.x by default. Pin from the run if you need newer.
+  XCODE_VERSION: '26.1.1'
+
+jobs:
+  ipa:
+    name: Unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          if [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+          else
+            echo "::warning::Xcode ${XCODE_VERSION} not installed on this image, using the default"
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Cache the Kotlin/Native toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('android/gradle/libs.versions.toml') }}
+          restore-keys: konan-${{ runner.os }}-
+
+      - name: Link the Shared framework for the device
+        working-directory: android
+        run: ./gradlew :shared:linkDebugFrameworkIosArm64 --console=plain --stacktrace
+
+      - name: Stage the framework where the Xcode project expects it
+        run: |
+          set -euo pipefail
+          src="android/shared/build/bin/iosArm64/debugFramework/Shared.framework"
+          dst="android/shared/build/xcode-frameworks/Debug/iphoneos"
+          test -d "$src" || { echo "::error::$src was not produced"; ls -R android/shared/build/bin | head -50; exit 1; }
+          mkdir -p "$dst" "$dst/Shared.framework"
+          # A static framework ships the archive plus headers; a dynamic one ships the binary.
+          cp -R "$src"/. "$dst/Shared.framework"/
+          # The pbxproj run-script phase aborts on this variable, so Xcode uses the framework we
+          # just linked instead of calling embedAndSignAppleFrameworkForXcode (which needs a profile).
+          echo "OVERRIDE_KOTLIN_BUILD_IDE_SUPPORTED=YES" >> "$GITHUB_ENV"
+
+      - name: Build the app for the device
+        working-directory: iosApp
+        env:
+          # The pbxproj reads these three from Configuration/Config.xcconfig; overriding via the
+          # environment keeps the checked-in configuration file byte-identical to upstream.
+          BUNDLE_ID: ${{ env.BUNDLE_ID }}
+          APP_NAME: ${{ env.DISPLAY_NAME }}
+        run: |
+          set -euo pipefail
+          # CURRENT_PROJECT_VERSION: monotonically increasing build number, 1 + commits on the ref,
+          # so re-signed installs upgrade in place instead of refusing to overwrite.
+          build_number=$(( $(git rev-list --count HEAD) + 1 ))
+          echo "BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          xcodebuild \
+            -project iosApp.xcodeproj \
+            -target iosApp \
+            -configuration Debug \
+            -sdk iphoneos \
+            -arch arm64 \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            CURRENT_PROJECT_VERSION="$build_number" \
+            ONLY_ACTIVE_ARCH=YES \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | tail -n 40
+
+      - name: Package Payload/*.app into an unsigned IPA
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/dd/Build/Products/Debug-iphoneos/$APP_NAME.app"
+          test -d "$app" || { echo "::error::$app not found"; ls -R "$RUNNER_TEMP/dd/Build/Products" | head -60; exit 1; }
+
+          # Nothing from a machine-specific signing identity may survive into the artifact.
+          rm -rf "$app/_CodeSignature" "$app/embedded.mobileprovision" "$app/Frameworks/Shared.framework/_CodeSignature" 2>/dev/null || true
+          find "$app" -name '*.dSYM' -prune -exec rm -rf {} + 2>/dev/null || true
+
+          staging="$RUNNER_TEMP/ipa"
+          rm -rf "$staging"; mkdir -p "$staging/Payload"
+          cp -R "$app" "$staging/Payload/"
+
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          out="$GITHUB_WORKSPACE/dist/$APP_NAME-$version-$BUILD_NUMBER-unsigned.ipa"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          ( cd "$staging" && /usr/bin/zip -qry "$out" Payload )
+          echo "IPA=$out" >> "$GITHUB_ENV"
+
+      - name: Verify the artifact
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/dist"
+          unzip -l "$(basename "$IPA")" | head -20
+          tmp="$RUNNER_TEMP/verify"; rm -rf "$tmp"; mkdir -p "$tmp"
+          unzip -q "$IPA" -d "$tmp"
+          bundle="$tmp/Payload/$APP_NAME.app"
+          bin="$bundle/$APP_NAME"
+          test -x "$bin" || { echo "::error::missing executable"; exit 1; }
+          lipo -info "$bin"
+          lipo -info "$bin" | grep -q arm64 || { echo "::error::not arm64"; exit 1; }
+          echo "bundle id : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Info.plist")"
+          echo "version   : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$bundle/Info.plist") ($(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$bundle/Info.plist"))"
+          echo "min iOS   : $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$bundle/Info.plist" 2>/dev/null || echo n/a)"
+          echo "extensions: $(ls "$bundle/PlugIns" 2>/dev/null | tr '\n' ' ')"
+          # Unsigned means unsigned: codesign must not find a valid signature.
+          if codesign --verify --deep "$bundle" >/dev/null 2>&1; then
+            echo "::error::the bundle is still signed; a re-signer would reject it"
+            exit 1
+          fi
+          echo "no code signature present — correct for an unsigned IPA"
+          size=$(stat -f%z "$IPA" 2>/dev/null || stat -c%s "$IPA")
+          echo "size      : $((size / 1048576)) MB"
+          ( cd "$GITHUB_WORKSPACE/dist" && shasum -a 256 -- *.ipa > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-unsigned
+          path: |
+            dist/*.ipa
+            dist/SHA256SUMS
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Attach to a release when tagged
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            android/**/build/reports/
+          retention-days: 7
+          if-no-files-found: ignore
