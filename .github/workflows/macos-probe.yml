@@ -1,9 +1,0 @@
-name: macOS probe
-on:
-  workflow_dispatch:
-jobs:
-  probe:
-    runs-on: macos-15
-    timeout-minutes: 20
-    steps:
-      - run: echo "runner up"; xcodebuild -version; sw_vers
