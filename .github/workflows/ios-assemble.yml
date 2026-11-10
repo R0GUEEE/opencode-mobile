@@ -1,0 +1,190 @@
+name: iOS IPA (assemble)
+
+# Unsigned arm64 .ipa from ubuntu-latest. No macOS runner, no Apple account.
+#
+# Premise proven by ios-linux.yml run 42746290983: Apple's binaries link on Linux once you have
+# (a) an LLD that understands modern Apple relocation encodings and (b) text stubs carrying real
+# symbol tables. Both are on ubuntu-latest.
+#
+# Stages report independently, so a failure names the component rather than "build failed".
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        required: false
+        default: 'io.github.beppe2880.opencodemobile'
+      display_name:
+        required: false
+        default: 'OpenCode Mobile'
+      sdk_version:
+        required: false
+        default: '16.5'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/ios-assemble.yml']
+
+concurrency:
+  group: ios-assemble-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: OpenCodeMobile
+  BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'io.github.beppe2880.opencodemobile' }}
+  DISPLAY_NAME: ${{ github.event.inputs.display_name || 'OpenCode Mobile' }}
+  SDK_VERSION: ${{ github.event.inputs.sdk_version || '16.5' }}
+  XCODE_ROOT: ${{ github.workspace }}/.xcode
+  KONAN_VERSION: '2.4.21'
+  SKIKO_VERSION: '0.156.1'
+
+jobs:
+  tools:
+    name: 1 tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LLD 20
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lld-20
+          LLD=$(command -v ld.lld-20)
+          "$LLD" --version
+          "$LLD" --version | grep -qE 'LLD (2[0-9])' || { echo "::error::need LLD 20+"; exit 1; }
+          echo "LLD_BIN=$LLD" >> "$GITHUB_ENV"
+
+      - name: iPhoneOS SDK stubs
+        run: |
+          set -euo pipefail
+          curl -sSL --retry 3 "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" -o /tmp/sdks.tar.gz
+          tar xzf /tmp/sdks.tar.gz -C /tmp --wildcards "*/iPhoneOS${SDK_VERSION}.sdk/*"
+          mkdir -p "$XCODE_ROOT/SDKs"
+          rm -rf "$XCODE_ROOT/SDKs/iPhoneOS.sdk"
+          mv "/tmp/sdks-master/iPhoneOS${SDK_VERSION}.sdk" "$XCODE_ROOT/SDKs/iPhoneOS.sdk"
+          sdk="$XCODE_ROOT/SDKs/iPhoneOS.sdk"
+          test -f "$sdk/usr/lib/libSystem.tbd"
+          test -f "$sdk/System/Library/Frameworks/Foundation.framework/Foundation.tbd"
+          echo "frameworks: $(ls "$sdk/System/Library/Frameworks" | wc -l)"
+          echo "SDK_DIR=$sdk" >> "$GITHUB_ENV"
+
+      - name: Kotlin/Native distribution
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.konan"
+          if [ ! -d "$HOME/.konan/kotlin-native-prebuilt-linux-x86_64-$KONAN_VERSION" ]; then
+            curl -sSL --retry 3 -o /tmp/konan.tgz "https://github.com/JetBrains/kotlin/releases/download/v$KONAN_VERSION/kotlin-native-prebuilt-$KONAN_VERSION-linux-x86_64.tar.gz"
+            tar xzf /tmp/konan.tgz -C "$HOME/.konan"
+          fi
+          KONAN="$HOME/.konan/kotlin-native-prebuilt-linux-x86_64-$KONAN_VERSION"
+          test -d "$KONAN/klib/platform/ios_arm64/org.jetbrains.kotlin.native.platform.Foundation"
+          echo "KONAN_HOME=$KONAN" >> "$GITHUB_ENV"
+          echo "platform targets: $(ls "$KONAN/klib/platform" | tr '\n' ' ')"
+
+      - name: Skiko iOS natives
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/skiko && cd /tmp/skiko
+          base="https://repo1.maven.org/maven2/org/jetbrains/skiko/skiko-iosarm64/$SKIKO_VERSION"
+          curl -sS --retry 3 -f -o skiko.klib "$base/skiko-iosarm64-$SKIKO_VERSION.klib"
+          unzip -q -o skiko.klib
+          for f in default/targets/ios_arm64/included/*.a; do
+            python3 -c "import sys; p=sys.argv[1]; m=b'!<arch>'+bytes([10]); d=open(p,'rb').read(); i=d.find(m); open(p,'wb').write(d[i:] if i>0 else d)" "$f"
+          done
+          ls default/targets/ios_arm64/included/ | head -5
+          echo "SKIKO_NATIVES=/tmp/skiko/default/targets/ios_arm64/included" >> "$GITHUB_ENV"
+
+      - name: Capability check
+        run: |
+          set -euo pipefail
+          cd /tmp
+          printf 'extern int skcms_AreApproximateInverses_skiko(void);\nint main(void){return skcms_AreApproximateInverses_skiko() & 1;}\n' > cap.c
+          clang --target=arm64-apple-ios15.0 -c cap.c -o cap.o
+          "$LLD_BIN" -flavor darwin -arch arm64 -platform_version ios 15.0 15.0 -e _main -o cap.bin cap.o "$SKIKO_NATIVES/libskia.a" "$SDK_DIR/usr/lib/libSystem.tbd"
+          file cap.bin
+          echo "CAPABILITY OK"
+
+  swift:
+    name: 2 swift host
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Darwin target probe
+        run: |
+          set -euo pipefail
+          swiftc --version || true
+          cd iosApp
+          set +e
+          swiftc -target arm64-apple-ios15.0 -parse-as-library -c iosApp/iOSApp.swift -o /tmp/iOSApp.o 2>/tmp/swift.err
+          rc=$?
+          set -e
+          echo "exit=$rc"
+          head -12 /tmp/swift.err
+          {
+            echo "### swift host"
+            echo '```'
+            echo "swiftc exit=$rc"
+            head -6 /tmp/swift.err
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$rc" -eq 0
+
+      - name: Upload object
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-host
+          path: /tmp/iOSApp.o
+          retention-days: 3
+          if-no-files-found: ignore
+
+  kotlin:
+    name: 3 kotlin framework
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Compile ios_arm64 klibs
+        working-directory: android
+        run: |
+          set -euo pipefail
+          ./gradlew :shared:compileKotlinIosArm64 --console=plain --no-daemon \
+            -Pkotlin.native.ignoreDisabledTargets=true \
+            -Pkotlin.native.enableKlibsCrossCompilation=true 2>&1 | tee /tmp/compile.log | tail -40
+          find shared/build -name '*.klib' | head
+
+  package:
+    name: 4 package ipa
+    needs: [tools, swift, kotlin]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Stage results
+        run: |
+          {
+            echo "## stage status"
+            echo ""
+            echo "| stage | result |"
+            echo "|---|---|"
+            echo "| tools | ${{ needs.tools.result }} |"
+            echo "| swift | ${{ needs.swift.result }} |"
+            echo "| kotlin | ${{ needs.kotlin.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "${{ needs.tools.result }}" = "success"
+          test "${{ needs.swift.result }}" = "success"
+          test "${{ needs.kotlin.result }}" = "success"
