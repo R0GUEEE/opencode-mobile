@@ -100,8 +100,12 @@ jobs:
           V=${SKIKO_VERSION:-0.156.1}
           mkdir -p /tmp/skiko
           base="https://repo1.maven.org/maven2/org/jetbrains/skiko/skiko-iosarm64/$V"
-          curl -sS --retry 3 -o /tmp/skiko/skiko.klib "$base/skiko-iosarm64-$V.klib"
-          cd /tmp/skiko && tar xzf skiko.klib
+          curl -sS --retry 3 -f -o /tmp/skiko/skiko.klib "$base/skiko-iosarm64-$V.klib"
+          file /tmp/skiko/skiko.klib
+          cd /tmp/skiko
+          # A klib is a ZIP container, not a tarball.
+          unzip -q -o skiko.klib
+          echo "extracted:"; ls
           echo "prebuilt archives:"
           ls -la default/targets/ios_arm64/included/ 2>/dev/null
           # Skiko wraps its Mach-O archive in an LLVM bitcode header; the inner '!<arch>' is what
