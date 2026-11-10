@@ -103,15 +103,20 @@ jobs:
           echo "prebuilt archives:"
           ls -la default/targets/ios_arm64/included/ 2>/dev/null
           # Skiko wraps its Mach-O archive in an LLVM bitcode header; the inner '!<arch>' is what
-          # the linker wants. Strip the wrapper in place.
-          for f in default/targets/ios_arm64/included/*.a; do
-            off=$(LC_ALL=C grep -abo '!<arch>' "$f" | head -1 | cut -d: -f1)
-            if [ -n "${off:-}" ] && [ "$off" != "0" ]; then
-              tail -c +$((off + 1)) "$f" > "$f.inner" && mv "$f.inner" "$f"
-              echo "unwrapped $f at $off"
-            fi
-          done
-          head -c 8 default/targets/ios_arm64/included/libskia.a | od -An -c | head -1
+          # the linker wants. Strip the wrapper in place. (python3 rather than grep -b: offset
+          # reporting is not portable across GNU grep and busybox.)
+          cat > /tmp/unwrap.py <<'PY'
+          import sys
+          for path in sys.argv[1:]:
+              data = open(path, "rb").read()
+              i = data.find(b"!<arch>\n")
+              if i > 0:
+                  open(path, "wb").write(data[i:])
+                  print(f"unwrapped {path} at {i}")
+          PY
+          sed -i 's/^          //' /tmp/unwrap.py
+          python3 /tmp/unwrap.py default/targets/ios_arm64/included/*.a
+          head -c 8 default/targets/ios_arm64/included/libskia.a
 
       - name: Report
         run: |
