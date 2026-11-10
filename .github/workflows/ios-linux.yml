@@ -95,8 +95,8 @@ jobs:
       - name: Fetch Skiko's prebuilt iOS natives
         run: |
           set -euo pipefail
-          SKIKO_VERSION=$(grep -oP 'skiko\s*=\s*"\K[^"]+' android/gradle/*.toml 2>/dev/null | head -1)
-          echo "skiko pinned in toml: ${SKIKO_VERSION:-<none, resolved by compose>}"
+          SKIKO_VERSION=$(sed -n 's/.*skiko[[:space:]]*=[[:space:]]*"\([0-9][^"]*\)".*/\1/p' android/gradle/libs.versions.toml 2>/dev/null | head -1)
+          echo "skiko pinned in toml: ${SKIKO_VERSION:-<none, compose resolves it>}"
           V=${SKIKO_VERSION:-0.156.1}
           mkdir -p /tmp/skiko
           base="https://repo1.maven.org/maven2/org/jetbrains/skiko/skiko-iosarm64/$V"
@@ -111,22 +111,12 @@ jobs:
           # Skiko wraps its Mach-O archive in an LLVM bitcode header; the inner '!<arch>' is what
           # the linker wants. Strip the wrapper in place. (python3 rather than grep -b: offset
           # reporting is not portable across GNU grep and busybox.)
-          cat > /tmp/unwrap.py <<'PY'
-          import sys
-          MAGIC = b"!<arch>" + bytes([10])
-          for path in sys.argv[1:]:
-              with open(path, "rb") as fh:
-                  data = fh.read()
-              i = data.find(MAGIC)
-              if i > 0:
-                  with open(path, "wb") as fh:
-                      fh.write(data[i:])
-                  print("unwrapped", path, "at", i)
-          PY
-          sed -i 's/^          //' /tmp/unwrap.py
-          python3 -c "import ast,sys; ast.parse(open('/tmp/unwrap.py').read()); print('unwrap.py parses')"
-          python3 /tmp/unwrap.py default/targets/ios_arm64/included/*.a
-          head -c 8 default/targets/ios_arm64/included/libskia.a
+          # Skiko wraps each Mach-O archive in an LLVM bitcode header; the inner '!<arch>' is
+          # what the linker wants. Strip the wrapper in place, one file at a time.
+          for f in default/targets/ios_arm64/included/*.a; do
+            python3 -c "import sys; p=sys.argv[1]; m=b'!<arch>'+bytes([10]); d=open(p,'rb').read(); i=d.find(m); open(p,'wb').write(d[i:] if i>0 else d); print('unwrap', p, i)" "$f"
+          done
+          head -c 8 default/targets/ios_arm64/included/libskia.a | od -An -c | head -1
 
       - name: Report
         run: |
