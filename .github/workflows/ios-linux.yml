@@ -78,8 +78,10 @@ jobs:
           set -euo pipefail
           curl -sSL --retry 3 "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" -o /tmp/sdks.tar.gz
           tar xzf /tmp/sdks.tar.gz -C /tmp --wildcards "*/iPhoneOS${SDK_VERSION}.sdk/*"
-          mv "/tmp/sdks-master/iPhoneOS${SDK_VERSION}.sdk" "$XCODE_ROOT/SDKs/iPhoneOS.sdk" || {
-            mkdir -p "$XCODE_ROOT/SDKs"; mv "/tmp/sdks-master/iPhoneOS${SDK_VERSION}.sdk" "$XCODE_ROOT/SDKs/iPhoneOS.sdk"; }
+          mkdir -p "$XCODE_ROOT/SDKs"
+          rm -rf "$XCODE_ROOT/SDKs/iPhoneOS.sdk"
+          mv "/tmp/sdks-master/iPhoneOS${SDK_VERSION}.sdk" "$XCODE_ROOT/SDKs/iPhoneOS.sdk"
+          test -d "$XCODE_ROOT/SDKs/iPhoneOS.sdk/System/Library/Frameworks" || { echo "::error::SDK not extracted"; exit 1; }
           echo "framework stubs: $(ls "$XCODE_ROOT/SDKs/iPhoneOS.sdk/System/Library/Frameworks" | wc -l)"
           echo "dylib stubs:     $(ls "$XCODE_ROOT/SDKs/iPhoneOS.sdk/usr/lib"/*.tbd | wc -l)"
 
@@ -107,14 +109,18 @@ jobs:
           # reporting is not portable across GNU grep and busybox.)
           cat > /tmp/unwrap.py <<'PY'
           import sys
+          MAGIC = b"!<arch>" + bytes([10])
           for path in sys.argv[1:]:
-              data = open(path, "rb").read()
-              i = data.find(b"!<arch>\n")
+              with open(path, "rb") as fh:
+                  data = fh.read()
+              i = data.find(MAGIC)
               if i > 0:
-                  open(path, "wb").write(data[i:])
-                  print(f"unwrapped {path} at {i}")
+                  with open(path, "wb") as fh:
+                      fh.write(data[i:])
+                  print("unwrapped", path, "at", i)
           PY
           sed -i 's/^          //' /tmp/unwrap.py
+          python3 -c "import ast,sys; ast.parse(open('/tmp/unwrap.py').read()); print('unwrap.py parses')"
           python3 /tmp/unwrap.py default/targets/ios_arm64/included/*.a
           head -c 8 default/targets/ios_arm64/included/libskia.a
 
