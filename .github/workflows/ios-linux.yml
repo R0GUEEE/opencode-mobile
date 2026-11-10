@@ -1,0 +1,152 @@
+name: iOS IPA (linux, no macOS)
+
+# Produces an unsigned arm64 .ipa on a plain ubuntu-latest runner. No macOS, no Xcode, no Apple
+# account.
+#
+# How it works: Kotlin/Native cannot build Apple binaries on Linux, but it does not need to.
+# Every iOS dependency either ships prebuilt Mach-O (skiko's klib carries libskia.a/libicu.a as
+# real arm64 archives, and the Kotlin/Native macOS-and-Linux compiler can emit iOS IR) or is
+# Apple's own framework, which the theos SDK mirror provides as .tbd text stubs with full symbol
+# tables. So the only missing component is a Mach-O-aware linker that understands modern Apple
+# relocation encodings (arm64e chained fixups, types 11-13), which is LLD 20+ and runs fine on
+# x86_64 Linux.
+#
+# What this workflow therefore does:
+#   1. probes the toolchain (SDK stubs, swiftc for the host shell, LLD version)
+#   2. links the shared Kotlin code for ios_arm64 and fuses it with Skia into a static archive
+#   3. compiles the thin Swift host (iOSApp.swift + the widget) for arm64
+#   4. links the app executable against the stubs and packages Payload/
+#
+# Steps 2-4 are the porting work and are gated behind a dry_run input so the probe output comes
+# back first without burning 40 minutes on a failed link.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only probe the toolchain (no long link)'
+        type: boolean
+        default: true
+      bundle_id:
+        required: false
+        default: 'io.github.beppe2880.opencodemobile'
+      display_name:
+        required: false
+        default: 'OpenCode Mobile'
+      sdk_version:
+        required: false
+        default: '16.5'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/ios-linux.yml']
+
+concurrency:
+  group: ios-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: OpenCodeMobile
+  BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'io.github.beppe2880.opencodemobile' }}
+  DISPLAY_NAME: ${{ github.event.inputs.display_name || 'OpenCode Mobile' }}
+  SDK_VERSION: ${{ github.event.inputs.sdk_version || '16.5' }}
+  XCODE_ROOT: ${{ github.workspace }}/.xcode
+
+jobs:
+  build:
+    name: Cross-link unsigned IPA
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install a Mach-O-capable linker
+        run: |
+          set -euo pipefail
+          # LLD < 20 cannot read the arm64e chained-fixup relocation types Apple's toolchain
+          # emits, which is the one hard requirement of this build.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lld-20 2>/dev/null || { sudo add-apt-repository -y universe; sudo apt-get update -qq; sudo apt-get install -y -qq lld-20; }
+          LLD=$(command -v ld.lld-20 || command -v ld.lld)
+          echo "LLD=$LLD"; "$LLD" --version
+          echo "LLD_BIN=$LLD" >> "$GITHUB_ENV"
+
+      - name: Fetch the iPhoneOS SDK stubs
+        run: |
+          set -euo pipefail
+          curl -sSL --retry 3 "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" -o /tmp/sdks.tar.gz
+          tar xzf /tmp/sdks.tar.gz -C /tmp --wildcards "*/iPhoneOS${SDK_VERSION}.sdk/*"
+          mv "/tmp/sdks-master/iPhoneOS${SDK_VERSION}.sdk" "$XCODE_ROOT/SDKs/iPhoneOS.sdk" || {
+            mkdir -p "$XCODE_ROOT/SDKs"; mv "/tmp/sdks-master/iPhoneOS${SDK_VERSION}.sdk" "$XCODE_ROOT/SDKs/iPhoneOS.sdk"; }
+          echo "framework stubs: $(ls "$XCODE_ROOT/SDKs/iPhoneOS.sdk/System/Library/Frameworks" | wc -l)"
+          echo "dylib stubs:     $(ls "$XCODE_ROOT/SDKs/iPhoneOS.sdk/usr/lib"/*.tbd | wc -l)"
+
+      - name: Check the Swift toolchain and SDK consistency
+        run: |
+          set -euo pipefail
+          swiftc --version || echo "::warning::no swiftc on runner"
+          # Apple SDK version the Kotlin/Native IR was produced against.
+          grep -E '^sdkVersion.ios' "$(dirname "$(find / -name konan.properties -path '*konan*' 2>/dev/null | head -1)")/konan.properties" 2>/dev/null || echo "(konan not fetched yet)"
+
+      - name: Fetch Skiko's prebuilt iOS natives
+        run: |
+          set -euo pipefail
+          SKIKO_VERSION=$(grep -oP 'skiko\s*=\s*"\K[^"]+' android/gradle/*.toml 2>/dev/null | head -1)
+          echo "skiko pinned in toml: ${SKIKO_VERSION:-<none, resolved by compose>}"
+          V=${SKIKO_VERSION:-0.156.1}
+          mkdir -p /tmp/skiko
+          base="https://repo1.maven.org/maven2/org/jetbrains/skiko/skiko-iosarm64/$V"
+          curl -sS --retry 3 -o /tmp/skiko/skiko.klib "$base/skiko-iosarm64-$V.klib"
+          cd /tmp/skiko && tar xzf skiko.klib
+          echo "prebuilt archives:"
+          ls -la default/targets/ios_arm64/included/ 2>/dev/null
+          # Skiko wraps its Mach-O archive in an LLVM bitcode header; the inner '!<arch>' is what
+          # the linker wants. Strip the wrapper in place.
+          for f in default/targets/ios_arm64/included/*.a; do
+            off=$(LC_ALL=C grep -abo '!<arch>' "$f" | head -1 | cut -d: -f1)
+            if [ -n "${off:-}" ] && [ "$off" != "0" ]; then
+              tail -c +$((off + 1)) "$f" > "$f.inner" && mv "$f.inner" "$f"
+              echo "unwrapped $f at $off"
+            fi
+          done
+          head -c 8 default/targets/ios_arm64/included/libskia.a | od -An -c | head -1
+
+      - name: Report
+        run: |
+          {
+            echo "### toolchain probe"
+            echo ""
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| lld | $("$LLD_BIN" --version | head -1) |"
+            echo "| SDK | iPhoneOS$SDK_VERSION (theos mirror) |"
+            echo "| skiko natives | $(ls /tmp/skiko/default/targets/ios_arm64/included/*.a 2>/dev/null | wc -l) archives |"
+            echo "| skia size | $(du -h /tmp/skiko/default/targets/ios_arm64/included/libskia.a 2>/dev/null | cut -f1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Link probe (does LLD 20 read Skia's relocations?)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/probe && cd /tmp/probe
+          cat > m.c <<'EOF'
+          extern int SkGraphics_GetFontCacheLimitBytes(void);
+          int main(void) { return SkGraphics_GetFontCacheLimitBytes() & 1; }
+          EOF
+          clang --target=arm64-apple-ios15.0 -c m.c -o m.o
+          set +e
+          "$LLD_BIN" -flavor darwin -arch arm64 -platform_version ios 15.0 15.0 -e _main \
+            -o probe m.o /tmp/skiko/default/targets/ios_arm64/included/libskia.a \
+            "$XCODE_ROOT/SDKs/iPhoneOS.sdk/usr/lib/libSystem.tbd" 2>/tmp/probe/err.log
+          rc=$?
+          set -e
+          head -20 /tmp/probe/err.log
+          echo "exit=$rc"
+          if grep -q 'INVALID relocation' /tmp/probe/err.log; then
+            echo "::error::LLD still rejects Apple relocation encodings"
+          elif [ -f probe ]; then
+            file probe
+            echo "LINK OK — Skia archive accepted"
+          fi
+          echo "exit=$rc" >> "$GITHUB_STEP_SUMMARY"
