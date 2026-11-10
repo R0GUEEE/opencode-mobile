@@ -136,8 +136,8 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/probe && cd /tmp/probe
           cat > m.c <<'EOF'
-          extern int SkGraphics_GetFontCacheLimitBytes(void);
-          int main(void) { return SkGraphics_GetFontCacheLimitBytes() & 1; }
+          extern int skcms_AreApproximateInverses_skiko(void);
+          int main(void) { return skcms_AreApproximateInverses_skiko() & 1; }
           EOF
           clang --target=arm64-apple-ios15.0 -c m.c -o m.o
           set +e
