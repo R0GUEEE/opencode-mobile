@@ -1,0 +1,174 @@
+name: iOS link
+
+# Can Kotlin/Native's ios_arm64 *link* step be pointed at LLD 20 instead of Apple's ld64.lld?
+#
+# Established so far (runs 42746290983, 42753079890):
+#   - LLD 20 links Apple binaries on Linux when given .tbd stubs with real symbol tables  PROVEN
+#   - compileKotlinIosArm64 produces ios_arm64 klibs on ubuntu-latest in 3m44s              PROVEN
+#   - Linux swiftc cannot target Darwin                                                    CLOSED
+#
+# Remaining question: K/N only ships macOS conventions for whose linker runs the final step
+# (konan.properties has linker.macos_*.ios_arm64 and no linux_* entry). Those are plain
+# property strings, so this workflow supplies one: linker.linux_x64-ios_arm64 -> LLD 20, plus
+# the SDK path, and lets K/N drive LLD the way it would drive ld64.
+#
+# Two gates must open for the task to run at all:
+#   konan.properties  linker.<host>-<target>            (this workflow adds it)
+#   Gradle plugin     getEnabledOnCurrentHostForBinariesCompilation returns false on linux for
+#                     Apple targets, so the link task is disabled before K/N is consulted. The
+#                     plugin jar is patched in place: ifeq -> iconst_1; ireturn.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/ios-link.yml']
+
+concurrency:
+  group: ios-link-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SDK_VERSION: '16.5'
+  KONAN_VERSION: '2.4.21'
+
+jobs:
+  link:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: LLD 20 as the iOS linker
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lld-20
+          LLD=$(command -v ld.lld-20)
+          "$LLD" --version
+          mkdir -p /opt/ioslink
+          cat > /opt/ioslink/ld64.lld <<EOF
+          #!/bin/sh
+          exec $LLD -flavor darwin "\$@"
+          EOF
+          chmod 755 /opt/ioslink/ld64.lld
+          echo "wrapper: /opt/ioslink/ld64.lld"
+          /opt/ioslink/ld64.lld --version
+
+      - name: iPhoneOS SDK stubs
+        run: |
+          set -euo pipefail
+          curl -sSL --retry 3 "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" -o /tmp/s.tar.gz
+          tar xzf /tmp/s.tar.gz -C /tmp --wildcards "*/iPhoneOS${SDK_VERSION}.sdk/*"
+          sudo mkdir -p /opt/ioslink/SDKs
+          sudo rm -rf "/opt/ioslink/SDKs/iPhoneOS.sdk"
+          sudo mv "/tmp/sdks-master/iPhoneOS${SDK_VERSION}.sdk" /opt/ioslink/SDKs/iPhoneOS.sdk
+          test -f /opt/ioslink/SDKs/iPhoneOS.sdk/usr/lib/libSystem.tbd
+          echo ok
+
+      - name: Kotlin/Native distribution
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.konan"
+          curl -sSL --retry 3 -o /tmp/k.tgz "https://github.com/JetBrains/kotlin/releases/download/v$KONAN_VERSION/kotlin-native-prebuilt-$KONAN_VERSION-linux-x86_64.tar.gz"
+          tar xzf /tmp/k.tgz -C "$HOME/.konan"
+          K="$HOME/.konan/kotlin-native-prebuilt-linux-x86_64-$KONAN_VERSION"
+          test -d "$K/klib/platform/ios_arm64"
+          echo "KONAN=$K" >> "$GITHUB_ENV"
+
+      - name: Teach konan.properties about a Linux iOS linker
+        run: |
+          set -euo pipefail
+          P="$KONAN/konan/konan.properties"
+          cp "$P" "$P.orig"
+          python3 - "$P" <<'PY'
+          import sys, re
+          p = sys.argv[1]
+          t = open(p).read()
+          add = [
+            "linker.linux_x64-ios_arm64 = /opt/ioslink/ld64.lld",
+            "targetToolchain.linux_x64-ios_arm64 = /opt/ioslink",
+            "targetSysRoot.ios_arm64 = /opt/ioslink/SDKs/iPhoneOS.sdk",
+            "sdkVersion.ios = 16.5",
+          ]
+          for line in add:
+              key = line.split("=")[0].strip()
+              t = re.sub(rf"^{re.escape(key)}\s*=.*$", "", t, flags=re.M)
+          t += "\n# added for the Linux cross link\n" + "\n".join(add) + "\n"
+          open(p, "w").write(t)
+          print("patched:", *add, sep="\n  ")
+          PY
+          grep -n 'linux_x64-ios_arm64\|^targetSysRoot.ios_arm64' "$P"
+
+      - name: Let Gradle enable Apple targets on Linux
+        run: |
+          set -euo pipefail
+          # Resolve the plugin once so the jar lands in the module cache.
+          cd android
+          ./gradlew help --console=plain --no-daemon >/dev/null 2>&1 || true
+          cd ..
+          JAR=$(find ~/.gradle/caches/modules-2 -name 'kotlin-gradle-plugin-2.4.21*.jar' | head -1)
+          echo "plugin jar: $JAR"
+          test -n "$JAR" || { echo "::error::kotlin-gradle-plugin not in cache"; exit 1; }
+          python3 - "$JAR" <<'PY'
+          import sys, zipfile, shutil, io
+          jar = sys.argv[1]
+          name = "org/jetbrains/kotlin/gradle/plugin/mpp/KotlinNativeTargetPresetKt.class"
+          sig = bytes([0xb6, 0x00, 0x2c, 0x99, 0x00, 0x11, 0xbb, 0x00, 0x11])
+          zin = zipfile.ZipFile(jar)
+          items = {i.filename: zin.read(i.filename) for i in zin.infolist()}
+          zin.close()
+          d = bytearray(items[name])
+          at = d.find(sig)
+          if at < 0:
+              print("signature not found; class left untouched")
+          else:
+              d[at + 3] = 0x04   # iconst_1
+              d[at + 4] = 0xac   # ireturn
+              d[at + 5] = 0x00
+              d[at + 6] = 0x00
+              items[name] = bytes(d)
+              print("patched getEnabledOnCurrentHostForBinariesCompilation at", at)
+          with zipfile.ZipFile(jar, "w", zipfile.ZIP_DEFLATED) as z:
+              for k, v in items.items():
+                  z.writestr(k, v)
+          print("jar rewritten:", jar)
+          PY
+
+      - name: Link the Shared framework for ios_arm64
+        working-directory: android
+        run: |
+          set -euo pipefail
+          ./gradlew :shared:linkDebugFrameworkIosArm64 --console=plain --no-daemon \
+            -Pkotlin.native.ignoreDisabledTargets=true 2>&1 | tee /tmp/link.log | tail -60
+          find shared/build/bin -maxdepth 4 -name '*.framework' -o -maxdepth 4 -name 'Shared*' | head
+
+      - name: Inspect the result
+        if: always()
+        run: |
+          {
+            echo "### link stage"
+            echo '```'
+            grep -nE 'SKIPPED|FAILED|error|ld64|lld|Shared\.framework|BUILD' /tmp/link.log | tail -40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -la android/shared/build/bin/iosArm64/debugFramework/ 2>/dev/null || true
+
+      - name: Upload framework if produced
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-framework
+          path: android/shared/build/bin/iosArm64/debugFramework/
+          retention-days: 5
+          if-no-files-found: warn
